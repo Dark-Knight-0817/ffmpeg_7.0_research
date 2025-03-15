@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "avformat.h": "c",
+        "cmath": "c"
+    },
+    "Codegeex.RepoIndex": true,
+    "Codegeex.GenerationPreference": "automatic"
+}

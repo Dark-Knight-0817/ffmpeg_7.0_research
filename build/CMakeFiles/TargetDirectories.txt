@@ -1,0 +1,2 @@
+/Users/darkknight/Documents/learning resource/code/FFmpeg-master/build/CMakeFiles/edit_cache.dir
+/Users/darkknight/Documents/learning resource/code/FFmpeg-master/build/CMakeFiles/rebuild_cache.dir
