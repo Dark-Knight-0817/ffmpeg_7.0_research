@@ -1,1 +1,0 @@
-# ffmpeg_7.0_research
