@@ -1,0 +1,1 @@
+config:aarch64::generic:darwin:Apple clang version 15.0.0 (clang-1500.3.9.4):--enable-ffmpeg --enable-ffplay --enable-demuxers --enable-muxers --enable-protocols --enable-encoders --enable-decoders
