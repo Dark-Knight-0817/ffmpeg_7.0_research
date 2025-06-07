@@ -36,7 +36,7 @@ struct AVFifo {
     uint8_t *buffer;                    // 缓冲区
 
     size_t elem_size, nb_elems;         // 每个元素的大小、元素数量
-    size_t offset_r, offset_w;          // 读偏移、写偏移. 相当于单链的多指针，但是用 int 偏移量 + buf_size 更容易确定读、写边界
+    size_t offset_r, offset_w;          // 读偏移、写偏移. 循环缓冲区的双索引，非指针，是 int 偏移量 + buf_size 更容易确定读、写边界
     // distinguishes the ambiguous situation offset_r == offset_w
     int    is_empty;                    // 区分 offset_r == offset_w 的歧义
 

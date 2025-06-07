@@ -360,7 +360,8 @@ typedef struct VideoState {
 
     /*  进入休眠条件——1. PacketQueue队列满了，无法再塞进去数据 2. 超过最小缓存Size  */
     SDL_cond *continue_read_thread; // 当读取数据队列满了后,进入休眠,可以通过该 continue 唤醒读线程。
-} VideoState; // 对播放器的封装,
+} VideoState; // 对播放器的参数封装
+
 /* options specified by the user */
 static const AVInputFormat *file_iformat;
 static const char *input_filename;
