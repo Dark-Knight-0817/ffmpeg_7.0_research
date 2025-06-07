@@ -833,7 +833,7 @@ static void dump_stream_group(const AVFormatContext *ic, uint8_t *printed,
         break;
     }
 }
-
+// 打印媒体文件信息
 void av_dump_format(AVFormatContext *ic, int index,
                     const char *url, int is_output)
 {
@@ -841,16 +841,18 @@ void av_dump_format(AVFormatContext *ic, int index,
     uint8_t *printed = ic->nb_streams ? av_mallocz(ic->nb_streams) : NULL;
     if (ic->nb_streams && !printed)
         return;
-
+    // 基本文件信息
     av_log(NULL, AV_LOG_INFO, "%s #%d, %s, %s '%s':\n",
            is_output ? "Output" : "Input",
            index,
            is_output ? ic->oformat->name : ic->iformat->name,
            is_output ? "to" : "from", url);
+    // 元数据信息
     dump_metadata(NULL, ic->metadata, "  ", AV_LOG_INFO);
 
     if (!is_output) {
         av_log(NULL, AV_LOG_INFO, "  Duration: ");
+        // 时长和比特率信息
         if (ic->duration != AV_NOPTS_VALUE) {
             int64_t hours, mins, secs, us;
             int64_t duration = ic->duration + (ic->duration <= INT64_MAX - 5000 ? 5000 : 0);
@@ -882,7 +884,7 @@ void av_dump_format(AVFormatContext *ic, int index,
             av_log(NULL, AV_LOG_INFO, "N/A");
         av_log(NULL, AV_LOG_INFO, "\n");
     }
-
+    // 章节信息
     if (ic->nb_chapters)
         av_log(NULL, AV_LOG_INFO, "  Chapters:\n");
     for (i = 0; i < ic->nb_chapters; i++) {
@@ -895,7 +897,7 @@ void av_dump_format(AVFormatContext *ic, int index,
 
         dump_metadata(NULL, ch->metadata, "      ", AV_LOG_INFO);
     }
-
+    // 节目信息（对于TS流等）
     if (ic->nb_programs) {
         int j, k, total = 0;
         for (j = 0; j < ic->nb_programs; j++) {
@@ -915,10 +917,10 @@ void av_dump_format(AVFormatContext *ic, int index,
         if (total < ic->nb_streams)
             av_log(NULL, AV_LOG_INFO, "  No Program\n");
     }
-
+    // 流组信息
     for (i = 0; i < ic->nb_stream_groups; i++)
          dump_stream_group(ic, printed, i, index, is_output);
-
+    // 各个流的详细信息
     for (i = 0; i < ic->nb_streams; i++)
         if (!printed[i])
             dump_stream_format(ic, i, -1, index, is_output, AV_LOG_INFO);

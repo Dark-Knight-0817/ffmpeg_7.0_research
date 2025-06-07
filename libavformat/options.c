@@ -151,6 +151,15 @@ static int io_open_default(AVFormatContext *s, AVIOContext **pb,
 
     av_log(s, loglevel, "Opening \'%s\' for %s\n", url, flags & AVIO_FLAG_WRITE ? "writing" : "reading");
 
+    /**
+     * @brief 解析URL，查找白名单，选择适当的协议处理器
+     * @param pb: 返回的AVIOContext指针
+     * @param url: 要打开的URL（可能是本地文件路径或网络URL）
+     * @param flags: 打开标志（读/写等）
+     * @param interrupt_callback: 中断回调
+     * @param options: 额外选项
+     * @param protocol_whitelist/blacklist: 协议白名单/黑名单
+     */
     return ffio_open_whitelist(pb, url, flags, &s->interrupt_callback, options, s->protocol_whitelist, s->protocol_blacklist);
 }
 
@@ -165,22 +174,22 @@ AVFormatContext *avformat_alloc_context(void)
     FFFormatContext *si;        // FFmpeg格式上下文
     AVFormatContext *s;         // 公共格式上下文
 
-    fci = av_mallocz(sizeof(*fci)); // av_mallocz 库函数,用于为 FormatContextInternal 结构分配内存并初始化
+    fci = av_mallocz(sizeof(*fci)); // 进行 32 bit 字节对齐的内存分配
     if (!fci)
         return NULL;
 
     si = &fci->fc;
     s = &si->pub;
     s->av_class = &av_format_context_class; // 设置 AVClass
-    s->io_open  = io_open_default;          // 设置默认的 I/O 打开函数，在这里设置的 url 协议处理和网络连接
+    s->io_open  = io_open_default;          // 设置默认的 I/O 打开函数，在这里设置的 url 协议处理和网络连接！！！
     s->io_close2= io_close2_default;        // 设置默认的 I/O 关闭函数
 
     /*  设置默认选项    */
     av_opt_set_defaults(s);
 
     /*  为主数据包和解析数据包分配内存  */
-    si->pkt = av_packet_alloc();
-    si->parse_pkt = av_packet_alloc();
+    si->pkt = av_packet_alloc();            // 用于从文件/网络直接读取的原始数据，可能包含不完整的帧数据，用于底层数据读取
+    si->parse_pkt = av_packet_alloc();      // 存储解析处理后的完整数据，包含完整、可解码的帧，最终返回给用户
     /*  错误检查    */
     if (!si->pkt || !si->parse_pkt) {
         avformat_free_context(s);

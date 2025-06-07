@@ -539,11 +539,11 @@ static int packet_queue_init(PacketQueue *q)
     memset(q, 0, sizeof(PacketQueue));
     /**
      * @brief 
-     * @param 1 初始队列容量(number of elements)，这里是1个元素
+     * @param 1 初始循环数组容量(number of elements)，这里是1个元素
      * @param sizeof(MyAVPacketList): 每个元素的大小
      * @param AV_FIFO_FLAG_AUTO_GROW: 自动增长标志
      */
-    q->pkt_list = av_fifo_alloc2(1, sizeof(MyAVPacketList), AV_FIFO_FLAG_AUTO_GROW); // 分配和初始化一个 AVFifo（先进先出队列）结构
+    q->pkt_list = av_fifo_alloc2(1, sizeof(MyAVPacketList), AV_FIFO_FLAG_AUTO_GROW); // 分配和初始化一个 AVFifo 循环数组
 
     if (!q->pkt_list)
         return AVERROR(ENOMEM);
@@ -588,9 +588,24 @@ static void packet_queue_flush(PacketQueue *q)
     MyAVPacketList pkt1;    // 临时存储读取的数据包节点
 
     SDL_LockMutex(q->mutex);    // 加锁，保护队列操作的线程安全
-    /*  从FIFO队列中循环读取所有数据包，直到读完    */
+     /*
+     * 循环读取并释放所有数据包
+     * 
+     * av_fifo_read 的工作原理：
+     * 1. 从FIFO队列头部读取一个元素到pkt1
+     * 2. 自动将该元素从队列中移除
+     * 3. 返回值：>=0成功，<0失败/队列空
+     */
     while (av_fifo_read(q->pkt_list, &pkt1, 1) >= 0)
-        /*  释放数据包占用的内存    */
+        /*
+         * 释放AVPacket占用的内存
+         * 
+         * av_packet_free做了什么：
+         * 1. 释放packet->data指向的数据缓冲区，标记为可再利用，没有真正释放
+         * 2. 释放packet->side_data等附加数据
+         * 3. 将packet指针设为NULL
+         * 4. 重置packet的所有字段
+         */
         av_packet_free(&pkt1.pkt);
     /* 重置队列状态 */
     /*  // 范围检查：内容选择
@@ -3710,7 +3725,7 @@ static int read_thread(void *arg) // 该线程从本地硬盘or网络获取流�
     memset(st_index, -1, sizeof(st_index));
     is->eof = 0;
 
-    pkt = av_packet_alloc(); // 创建 packet
+    pkt = av_packet_alloc(); // 创建并默认初始化 packet
     if (!pkt) {
         av_log(NULL, AV_LOG_FATAL, "Could not allocate packet.\n");
         ret = AVERROR(ENOMEM);
@@ -3850,7 +3865,7 @@ static int read_thread(void *arg) // 该线程从本地硬盘or网络获取流�
     }
 
     /* 是否为网络实时流媒体 */
-    is->realtime = is_realtime(ic); // 判断实时流的协议类型
+    is->realtime = is_realtime(ic); // 根据解析媒体格式后获得的数据，去判断实时流的协议类型
 
     if (show_status)
         av_dump_format(ic, 0, is->filename, 0); // 显示格式信息（如果需要）

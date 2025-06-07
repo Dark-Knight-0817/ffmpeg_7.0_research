@@ -71,12 +71,22 @@ AVPacket *av_packet_alloc(void)
     return pkt;
 }
 
+// 彻底清理和释放一个AVPacket结构体及其所有关联的内存
 void av_packet_free(AVPacket **pkt)
 {
     if (!pkt || !*pkt)
         return;
-
-    av_packet_unref(*pkt);
+    /**
+     * 释放 packet->data 指向的数据缓冲区
+     * 释放 packet->side_data 等附加数据
+     * 重置所有字段为默认值
+     * 但保留AVPacket结构体本身
+     */
+    av_packet_unref(*pkt);  
+    /**
+     * 释放AVPacket结构体本身的内存
+     * 将指针设置为NULL（*pkt = NULL）
+     */
     av_freep(pkt);
 }
 

@@ -181,8 +181,11 @@ static int init_input(AVFormatContext *s, const char *filename,
 
     /*  已知格式且该格式不需要文件（AVFMT_NOFILE 标志）;
         未知格式，尝试使用 av_probe_input_format2 来猜测格式;
+        调用各自的打开方式：
+        本地文件：ff_file_protocol，
+        TTP(S)：使用 ff_http_protocol 或 ff_https_protocol
     */
-    if ((ret = s->io_open(s, &s->pb, filename, AVIO_FLAG_READ | s->avio_flags, options)) < 0)
+    if ((ret = s->io_open(s, &s->pb, filename, AVIO_FLAG_READ | s->avio_flags, options)) < 0)    
         return ret;
 
     /*  打开 I/O 上下文后，检查是否已经确定了格式   */
@@ -266,7 +269,7 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
         goto fail;
     }
 
-    /* 初始化输入 */
+    /* 初始化输入，初始化网络流的打开方式 */
     if ((ret = init_input(s, filename, &tmp)) < 0)  // 用来初始化输入并确定输入文件的格式类型的
         goto fail;
     s->probe_score = ret;
@@ -2789,11 +2792,12 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options) // �
             }
         }
         /* We did not get all the codec info, but we read too much data. 
-            检查是否已读取足够的数据    */
-        if (read_size >= probesize) {
+            avformat_find_stream_info只是查找流的信息，所以只要所需数据足够，就可以退出最外查找的for循环了    */
+        if (read_size >= probesize) {   // 达到探测大小限制就停止
             ret = count;
             av_log(ic, AV_LOG_DEBUG,
                    "Probe buffer size limit of %"PRId64" bytes reached\n", probesize);
+            // 分析编解码器参数、帧率等
             for (unsigned i = 0; i < ic->nb_streams; i++) {
                 AVStream *const st  = ic->streams[i];
                 FFStream *const sti = ffstream(st);
@@ -2805,7 +2809,7 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options) // �
                            "Stream #%d: not enough frames to estimate rate; "
                            "consider increasing probesize\n", i);
             }
-            break;
+            break;  // 这里退出最外for(;;)循环
         }
 
         /* NOTE: A new stream can be added there if no header in file

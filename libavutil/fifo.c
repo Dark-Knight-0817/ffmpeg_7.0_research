@@ -33,7 +33,7 @@
 #define AUTO_GROW_DEFAULT_BYTES (1024 * 1024)
 
 struct AVFifo {
-    uint8_t *buffer;                    // 缓冲区
+    uint8_t *buffer;                    // 连续内存缓冲区，可以理解为数组
 
     size_t elem_size, nb_elems;         // 每个元素的大小、元素数量
     size_t offset_r, offset_w;          // 读偏移、写偏移. 循环缓冲区的双索引，非指针，是 int 偏移量 + buf_size 更容易确定读、写边界
@@ -45,7 +45,7 @@ struct AVFifo {
 };
 
 AVFifo *av_fifo_alloc2(size_t nb_elems, size_t elem_size,
-                       unsigned int flags) // 分配和初始化一个 AVFifo（先进先出队列）结构
+                       unsigned int flags) // 分配和初始化一个 AVFifo（先进先出循环缓冲数组）结构
 {
     AVFifo *f; // 主要用于数据缓冲和管理
     void *buffer = NULL;
@@ -217,51 +217,174 @@ int av_fifo_write_from_cb(AVFifo *f, AVFifoCB read_cb,
     return fifo_write_common(f, NULL, nb_elems, read_cb, opaque);
 }
 
+/**
+ * @brief 作用：从环形FIFO缓冲区中读取数据，支持偏移量和回调函数
+ *        特点：只读取数据，不从队列中移除（peek操作）
+ * @param f         FIFO队列指针
+ * @param buf       目标缓冲区（如果使用memcpy模式）
+ * @param nb_elems  输入：期望读取的元素数量，输出：实际读取的元素数量
+ * @param offset    从队列头开始的偏移量
+ * @param write_cb  可选的回调函数，用于自定义数据处理
+ * @param opaque    传递给回调函数的用户数据
+ * @return          成功返回0，失败返回负数错误码
+ */
 static int fifo_peek_common(const AVFifo *f, uint8_t *buf, size_t *nb_elems,
                             size_t offset, AVFifoCB write_cb, void *opaque)
 {
-    size_t  to_read = *nb_elems;
-    size_t offset_r = f->offset_r;
-    size_t can_read = av_fifo_can_read(f);
-    int         ret = 0;
+    size_t  to_read = *nb_elems;        // 要读取的元素数量
+    size_t offset_r = f->offset_r;      // 读指针的当前位置（拷贝一份，不修改原值）
+    size_t can_read = av_fifo_can_read(f); // 队列中可读取的元素总数
+    int         ret = 0;                // 返回值
 
+    /*
+     * =============================================================================
+     * 第一步：参数验证和边界检查
+     * =============================================================================
+     * 检查参数有效性：
+     * 1. offset不能超过可读取的数据量
+     * 2. 要读取的数据量不能超过剩余可读数据量
+     * 
+     * 例如：队列有10个元素，offset=3，要读取9个
+     * 实际可读取：10-3=7个，但请求9个 → 错误
+     */
     if (offset > can_read || to_read > can_read - offset) {
         *nb_elems = 0;
         return AVERROR(EINVAL);
     }
 
+    /*
+     * =============================================================================
+     * 第二步：计算实际的读取起始位置
+     * =============================================================================
+     * 
+     * 环形缓冲区的指针计算：
+     * 需要将逻辑偏移量转换为实际的缓冲区索引
+     */
+    
+    /*
+     * 计算加上offset后的读指针位置
+     * 
+     * 环形缓冲区示意图：
+     * +---+---+---+---+---+---+---+---+
+     * | 4 | 5 | 6 | 7 | 0 | 1 | 2 | 3 |  ← 物理缓冲区
+     * +---+---+---+---+---+---+---+---+
+     *                   ↑           ↑
+     *               offset_r=4    nb_elems=8
+     * 
+     * 如果 offset=3，要从逻辑位置3开始读取：
+     * 实际位置 = (4 + 3) % 8 = 7
+     */
     if (offset_r >= f->nb_elems - offset)
         offset_r -= f->nb_elems - offset;
     else
         offset_r += offset;
 
+    /*
+     * =============================================================================
+     * 第三步：循环读取数据
+     * =============================================================================
+     * 
+     * 由于是环形缓冲区，可能需要分多次读取：
+     * 1. 从当前位置读到缓冲区末尾
+     * 2. 从缓冲区开头继续读取剩余数据
+     */
     while (to_read > 0) {
+        /*
+         * 计算本次读取的长度
+         * 
+         * 限制因素：
+         * 1. 剩余要读取的数量：to_read
+         * 2. 从当前位置到缓冲区末尾的距离：f->nb_elems - offset_r
+         * 
+         * 取较小值，确保不会越界
+         */
         size_t    len = FFMIN(f->nb_elems - offset_r, to_read);
+        /*
+         * 计算实际的内存地址
+         * 
+         * f->buffer：缓冲区基地址
+         * offset_r：当前元素索引
+         * f->elem_size：每个元素的字节大小
+         * 
+         * 最终地址 = 基地址 + 索引 * 元素大小
+         */
         uint8_t *rptr = f->buffer + offset_r * f->elem_size;
 
+        /*
+         * 数据传输：支持两种模式
+         */
         if (write_cb) {
+            /*
+             * 模式1：回调函数模式
+             * 
+             * 用途：
+             * - 自定义数据处理逻辑
+             * - 流式处理大量数据
+             * - 避免额外的内存拷贝
+             * 
+             * 回调函数可以：
+             * - 直接处理数据而不拷贝
+             * - 修改len来控制处理数量
+             * - 返回错误码中断处理
+             */
             ret = write_cb(opaque, rptr, &len);
             if (ret < 0 || len == 0)
-                break;
+                break;      // 回调出错或处理完毕，退出循环
         } else {
+            /*
+             * 模式2：内存拷贝模式
+             * 
+             * 直接将数据拷贝到目标缓冲区
+             * len * f->elem_size：要拷贝的总字节数
+             */
             memcpy(buf, rptr, len * f->elem_size);
-            buf += len * f->elem_size;
+            buf += len * f->elem_size;  // 移动目标缓冲区指针
         }
-        offset_r += len;
+        /*
+         * 更新读取位置和剩余数量
+         */
+        offset_r += len;    // 移动读指针
+        /*
+         * 处理环形缓冲区的环绕
+         * 
+         * 如果读指针到达缓冲区末尾，环绕到开头
+         */
         if (offset_r >= f->nb_elems)
             offset_r = 0;
-        to_read -= len;
+        to_read -= len;     // 减少剩余读取数量
     }
-
+    /*
+     * =============================================================================
+     * 第四步：返回结果
+     * =============================================================================
+     */
+    
+    /*
+     * 计算实际读取的元素数量
+     * 
+     * 原始请求：*nb_elems
+     * 未完成的：to_read  
+     * 实际完成：*nb_elems - to_read
+     */
     *nb_elems -= to_read;
 
     return ret;
 }
 
+/**
+ * @brief 从FIFO队列读取数据并自动移除
+ * 
+ * 从FIFO队列读取指定数量的元素
+ * 
+ * @param f        FIFO队列指针
+ * @param buf      存储读取数据的缓冲区
+ * @param nb_elems 要读取的元素数量
+ * @return         实际读取的元素数量，<0表示错误
+ */
 int av_fifo_read(AVFifo *f, void *buf, size_t nb_elems)
 {
-    int ret = fifo_peek_common(f, buf, &nb_elems, 0, NULL, NULL);
-    av_fifo_drain2(f, nb_elems);
+    int ret = fifo_peek_common(f, buf, &nb_elems, 0, NULL, NULL);   // 复制数据到缓冲区
+    av_fifo_drain2(f, nb_elems);    // 从队列中移除数据
     return ret;
 }
 
@@ -284,17 +407,116 @@ int av_fifo_peek_to_cb(const AVFifo *f, AVFifoCB write_cb, void *opaque,
     return fifo_peek_common(f, NULL, nb_elems, offset, write_cb, opaque);
 }
 
+/** 
+ * @brief  环形缓冲区数据移除操作
+ * 
+ * 作用：从FIFO队列中移除指定数量的元素（不读取数据，只是标记为已消费）
+ * 特点：O(1)时间复杂度，只需要移动读指针
+ * 
+ * @note  1. 高效性：
+ *    - O(1)时间复杂度，只修改一个指针
+ *    - 无需实际移动或清理内存中的数据
+ *    - 无需调用free或memset等耗时操作
+ * 
+ * 2. 内存管理：
+ *    - 被"移除"的元素在物理内存中仍然存在
+ *    - 这些内存空间会在下次写入时被覆盖
+ *    - 避免了频繁的内存分配/释放
+ * 
+ * 3. 线程安全：
+ *    - 函数本身不提供锁保护
+ *    - 需要调用者确保线程安全（如在packet_queue_flush中的mutex）
+ * 
+ * 4. 数据一致性：
+ *    - 通过av_assert0确保不会移除超量元素
+ *    - 保证队列状态的逻辑正确性
+ */
 void av_fifo_drain2(AVFifo *f, size_t size)
 {
+    // 获取当前队列中可读取的元素总数
     const size_t cur_size = av_fifo_can_read(f);
 
+    /*
+     * 断言检查：确保不会移除超过队列中现有的元素数量
+     * 
+     * 这是一个调试时的安全检查：
+     * - 如果size > cur_size，程序会立即终止（debug模式）
+     * - 防止逻辑错误导致的数据不一致
+     * 
+     * 例如：队列中有5个元素，但试图移除8个 → 触发断言失败
+     */
     av_assert0(cur_size >= size);
+    /*
+     * 检查是否将队列完全排空
+     * 
+     * 如果移除的元素数量等于当前所有元素数量，
+     * 则标记队列为空状态，这可能会触发优化：
+     * - 重置内部指针到初始位置
+     * - 清理某些缓存状态
+     * - 为后续操作做准备
+     */
     if (cur_size == size)
         f->is_empty = 1;
-
+    /*
+     * 环形缓冲区指针移动的关键逻辑
+     * 
+     * 需要处理两种情况：
+     * 1. 正常情况：移动后不会超过缓冲区末尾
+     * 2. 环绕情况：移动后需要从缓冲区开头继续
+     * 
+     * 算法原理：
+     * - 如果 当前位置 + 移动距离 >= 缓冲区大小，则需要环绕
+     * - 环绕的计算方式：从总大小中减去移动距离，再从当前位置减去
+     */
     if (f->offset_r >= f->nb_elems - size)
+        /*
+         * 情况1：需要环绕的情况
+         * 
+         * 示例解释：
+         * 缓冲区大小：8个元素 (nb_elems = 8)
+         * 当前读指针：位置6 (offset_r = 6)  
+         * 要移除：3个元素 (size = 3)
+         * 
+         * 检查：6 >= 8 - 3 = 5 → 6 >= 5 → true（需要环绕）
+         * 
+         * 计算：offset_r = 6 - (8 - 3) = 6 - 5 = 1
+         * 
+         * 物理含义：
+         * 移除位置6、7、0的3个元素，新的读指针应该在位置1
+         * 
+         * 环形缓冲区示意：
+         * +---+---+---+---+---+---+---+---+
+         * | X | ← | 2 | 3 | 4 | 5 | X | X |  ← X表示被移除的元素
+         * +---+---+---+---+---+---+---+---+
+         *   0   1   2   3   4   5   6   7
+         *       ↑                   ↑
+         *   新读指针              原读指针
+         */
         f->offset_r -= f->nb_elems - size;
     else
+        /*
+         * 情况2：不需要环绕的情况
+         * 
+         * 示例解释：
+         * 缓冲区大小：8个元素 (nb_elems = 8)
+         * 当前读指针：位置2 (offset_r = 2)
+         * 要移除：3个元素 (size = 3)
+         * 
+         * 检查：2 >= 8 - 3 = 5 → 2 >= 5 → false（不需要环绕）
+         * 
+         * 计算：offset_r = 2 + 3 = 5
+         * 
+         * 物理含义：
+         * 移除位置2、3、4的3个元素，新的读指针在位置5
+         * 
+         * 环形缓冲区示意：
+         * +---+---+---+---+---+---+---+---+
+         * | 0 | 1 | X | X | X | ← | 6 | 7 |  ← X表示被移除的元素
+         * +---+---+---+---+---+---+---+---+
+         *   0   1   2   3   4   5   6   7
+         *                       ↑   ↑
+         *                   新读指针 原读指针
+         */
         f->offset_r += size;
 }
 

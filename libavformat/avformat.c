@@ -456,70 +456,127 @@ int av_find_default_stream_index(AVFormatContext *s)
     return best_stream;
 }
 
+/**
+ * @brief 在AVFormatContext中查找指定媒体类型的最佳流
+ * 
+ * @param ic                输入的格式上下文，包含所有流信息
+ * @param type              要查找的媒体类型（视频/音频/字幕等）
+ * @param wanted_stream_nb  指定要的流索引，-1表示自动选择最佳
+ * @param related_stream    相关流索引，用于在同一program中查找
+ * @param decoder_ret       返回找到的解码器指针（可选）
+ * @param flags             标志位（当前未使用）
+ * @return                  最佳流的索引，失败返回负数错误码
+ */
 int av_find_best_stream(AVFormatContext *ic, enum AVMediaType type,
                         int wanted_stream_nb, int related_stream,
                         const AVCodec **decoder_ret, int flags)
 {
-    int nb_streams = ic->nb_streams;
-    int ret = AVERROR_STREAM_NOT_FOUND;
-    int best_count = -1, best_multiframe = -1, best_disposition = -1;
+    int nb_streams = ic->nb_streams;        // 默认搜索所有流
+    int ret = AVERROR_STREAM_NOT_FOUND;     // 默认返回"未找到流"错误
+    // 用于记录当前找到的最佳流的各项指标
+    int best_count = -1;                    // 最佳流的解码帧数
+    int best_multiframe = -1;               // 最佳流的多帧指标
+    int best_disposition = -1;              // 最佳流的disposition优先级
+    // 当前检查流的各项指标
     int count, multiframe, disposition;
-    int64_t best_bitrate = -1;
+    int64_t best_bitrate = -1;              // 最佳流的比特率
     int64_t bitrate;
-    unsigned *program = NULL;
+    unsigned *program = NULL;               // 节目流索引数组
     const AVCodec *decoder = NULL, *best_decoder = NULL;
 
+    /*
+     * 第一步：确定搜索范围
+     * 如果指定了related_stream且wanted_stream_nb为-1，
+     * 则在包含related_stream的program中搜索
+     */
     if (related_stream >= 0 && wanted_stream_nb < 0) {
         AVProgram *p = av_find_program_from_stream(ic, NULL, related_stream);
         if (p) {
-            program    = p->stream_index;
-            nb_streams = p->nb_stream_indexes;
+            program    = p->stream_index;       // 限制在该节目的流中搜索
+            nb_streams = p->nb_stream_indexes;  // 更新搜索流的数量
         }
     }
+    /*
+     * 第二步：遍历所有候选流，找出最佳流
+     */
     for (unsigned i = 0; i < nb_streams; i++) {
+        // 获取真实的流索引（考虑program限制）
         int real_stream_index = program ? program[i] : i;
         AVStream *st          = ic->streams[real_stream_index];
         AVCodecParameters *par = st->codecpar;
+        /*
+         * 基本过滤条件
+         */
+        // 1. 媒体类型必须匹配
         if (par->codec_type != type)
             continue;
+        // 2. 如果指定了具体流号，必须匹配
         if (wanted_stream_nb >= 0 && real_stream_index != wanted_stream_nb)
             continue;
+        // 3. 对于音频流，必须有有效的声道和采样率
         if (type == AVMEDIA_TYPE_AUDIO && !(par->ch_layout.nb_channels && par->sample_rate))
             continue;
+        /*
+         * 查找解码器（如果需要）
+         */
         if (decoder_ret) {
             decoder = ff_find_decoder(ic, st, par->codec_id);
             if (!decoder) {
+                // 没有可用解码器，记录错误但继续搜索
                 if (ret < 0)
                     ret = AVERROR_DECODER_NOT_FOUND;
                 continue;
             }
         }
+        /*
+         * 计算流的质量指标
+         */
+        // disposition优先级计算：
+        // - 非听障/视障辅助流 +1分
+        // - 默认流 +1分
+        // 总分0-2，越高越好
         disposition = !(st->disposition & (AV_DISPOSITION_HEARING_IMPAIRED | AV_DISPOSITION_VISUAL_IMPAIRED))
                       + !! (st->disposition & AV_DISPOSITION_DEFAULT);
-        count = ffstream(st)->codec_info_nb_frames;
-        bitrate = par->bit_rate;
-        multiframe = FFMIN(5, count);
+        count = ffstream(st)->codec_info_nb_frames;     // 解码的帧数（反映质量）
+        bitrate = par->bit_rate;                        // 比特率
+        multiframe = FFMIN(5, count);                   // 多帧指标（最多5）
+        /*
+         * 比较逻辑：按优先级依次比较
+         * 1. disposition优先级最重要
+         * 2. 相同disposition下，multiframe越大越好
+         * 3. 相同multiframe下，bitrate越大越好  
+         * 4. 相同bitrate下，count越小越好（更稳定）
+         */
         if ((best_disposition >  disposition) ||
             (best_disposition == disposition && best_multiframe >  multiframe) ||
             (best_disposition == disposition && best_multiframe == multiframe && best_bitrate >  bitrate) ||
             (best_disposition == disposition && best_multiframe == multiframe && best_bitrate == bitrate && best_count >= count))
             continue;
+        /*
+         * 找到更好的流，更新最佳记录
+         */
         best_disposition = disposition;
         best_count   = count;
         best_bitrate = bitrate;
         best_multiframe = multiframe;
-        ret          = real_stream_index;
+        ret          = real_stream_index;   // 记录最佳流索引
         best_decoder = decoder;
+        /*
+         * 如果在program中没找到合适的流，扩大搜索范围到所有流
+         */
         if (program && i == nb_streams - 1 && ret < 0) {
-            program    = NULL;
-            nb_streams = ic->nb_streams;
+            program    = NULL;                      // 取消program限制
+            nb_streams = ic->nb_streams;            // 搜索所有流
             /* no related stream found, try again with everything */
-            i = 0;
+            i = 0;                                  // 重新开始搜索
         }
     }
+    /*
+     * 返回结果
+     */
     if (decoder_ret)
-        *decoder_ret = best_decoder;
-    return ret;
+        *decoder_ret = best_decoder;    // 返回最佳解码器
+    return ret;                         // 返回最佳流索引或错误码
 }
 
 /**
