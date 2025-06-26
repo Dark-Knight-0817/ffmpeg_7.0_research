@@ -797,27 +797,67 @@ error:
     return ret;
 }
 
+
+/**
+ * 推测视频的采样宽高比(Sample Aspect Ratio)
+ * 
+ * @param format  格式上下文(可为NULL)
+ * @param stream  视频流指针(可为NULL)  
+ * @param frame   视频帧指针(可为NULL)
+ * @return        推测出的SAR，优先级：stream > frame > codec
+ */
 AVRational av_guess_sample_aspect_ratio(AVFormatContext *format, AVStream *stream, AVFrame *frame)
 {
+    // ===== 第1步：定义未定义状态和获取各来源的SAR =====
+
+    // 定义"未定义"的宽高比：0/1 = 0，表示无效或未知
     AVRational undef = {0, 1};
+    
+    // 从视频流中获取SAR（如果stream存在）
+    // stream->sample_aspect_ratio 通常来源于容器格式的元数据
     AVRational stream_sample_aspect_ratio = stream ? stream->sample_aspect_ratio : undef;
+
+    // 从编解码器参数中获取SAR（如果stream和codecpar都存在）
+    // stream->codecpar->sample_aspect_ratio 来源于编码器设置
     AVRational codec_sample_aspect_ratio  = stream && stream->codecpar ? stream->codecpar->sample_aspect_ratio : undef;
+
+    // 从当前帧中获取SAR，如果帧不存在则使用编解码器的SAR
+    // frame->sample_aspect_ratio 可能由解码器动态设置
     AVRational frame_sample_aspect_ratio  = frame  ? frame->sample_aspect_ratio  : codec_sample_aspect_ratio;
 
-    av_reduce(&stream_sample_aspect_ratio.num, &stream_sample_aspect_ratio.den,
-               stream_sample_aspect_ratio.num,  stream_sample_aspect_ratio.den, INT_MAX);
-    if (stream_sample_aspect_ratio.num <= 0 || stream_sample_aspect_ratio.den <= 0)
-        stream_sample_aspect_ratio = undef;
+    // ===== 第2步：规范化stream的SAR =====
 
+    // av_reduce(): 将分数约简到最简形式，防止整数溢出
+    // 例如：8/16 -> 1/2，避免数值过大导致计算错误
+    av_reduce(&stream_sample_aspect_ratio.num,  // 分子指针
+              &stream_sample_aspect_ratio.den,  // 分母指针
+               stream_sample_aspect_ratio.num,  // 原分子
+               stream_sample_aspect_ratio.den,  // 原分母
+               INT_MAX);                        // 最大允许值
+
+    // 验证stream SAR的有效性：分子和分母都必须为正数
+    // 无效情况：0/1, -1/2, 3/0 等
+    if (stream_sample_aspect_ratio.num <= 0 || stream_sample_aspect_ratio.den <= 0)
+        stream_sample_aspect_ratio = undef; // 标记为未定义
+
+    // ===== 第3步：规范化frame的SAR =====
+    
+    // 同样对frame的SAR进行约简处理
     av_reduce(&frame_sample_aspect_ratio.num, &frame_sample_aspect_ratio.den,
                frame_sample_aspect_ratio.num,  frame_sample_aspect_ratio.den, INT_MAX);
+       
+    // 验证frame SAR的有效性
     if (frame_sample_aspect_ratio.num <= 0 || frame_sample_aspect_ratio.den <= 0)
-        frame_sample_aspect_ratio = undef;
+        frame_sample_aspect_ratio = undef;  // 标记为未定义
 
-    if (stream_sample_aspect_ratio.num)
-        return stream_sample_aspect_ratio;
+    // ===== 第4步：按优先级返回结果 =====
+    
+    // 优先级规则：stream SAR > frame SAR
+    // 理由：stream级别的SAR更权威，通常来自容器格式的官方元数据
+    if (stream_sample_aspect_ratio.num)     // 如果stream SAR有效(分子非0)
+        return stream_sample_aspect_ratio;  // 返回stream的SAR
     else
-        return frame_sample_aspect_ratio;
+        return frame_sample_aspect_ratio;   // 否则返回frame的SAR(可能是undef)
 }
 
 AVRational av_guess_frame_rate(AVFormatContext *format, AVStream *st, AVFrame *frame)

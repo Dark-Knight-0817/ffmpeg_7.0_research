@@ -703,7 +703,7 @@ static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *seria
 
 static int decoder_init(Decoder *d, AVCodecContext *avctx, PacketQueue *queue, SDL_cond *empty_queue_cond) { // 初始化解码器结构
     memset(d, 0, sizeof(Decoder));
-    d->pkt = av_packet_alloc(); // 为解码器分配一个 AVPacket 结构
+    d->pkt = av_packet_alloc(); // 为解码器分配一个默认参数的 AVPacket 结构
     if (!d->pkt)
         return AVERROR(ENOMEM);
     d->avctx = avctx; // 设置解码器上下文（AVCodecContext）
@@ -741,7 +741,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                 /*  获取解码    */
                 switch (d->avctx->codec_type) {
                     case AVMEDIA_TYPE_VIDEO:
-                        ret = avcodec_receive_frame(d->avctx, frame);
+                        ret = avcodec_receive_frame(d->avctx, frame);       // FFmpeg 用于接收解码后的帧或编码前的帧的通用接口
                         if (ret >= 0) { // 收到数据
                             if (decoder_reorder_pts == -1) {
                                 frame->pts = frame->best_effort_timestamp;  //  best_effort_timestamp 是vlc的概念. 是经过解码器，算法计算出来的值，主要是“尝试为可能有错误的时间戳猜测出适当单调的时间戳”
@@ -2367,6 +2367,7 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
         if (frame->pts != AV_NOPTS_VALUE)
             dpts = av_q2d(is->video_st->time_base) * frame->pts;    // 计算出秒为单位的pts
 
+        // 为当前视频帧推测并设置合适的采样宽高比
         frame->sample_aspect_ratio = av_guess_sample_aspect_ratio(is->ic, is->video_st, frame);
 
         /**
@@ -2610,76 +2611,119 @@ fail:
     return ret;
 }
 
+/**
+ * @brief 配置音频滤镜
+ * @param is 视频状态结构体指针，包含播放状态信息
+ * @param afilters 音频滤镜链字符串，如"volume=0.5"等
+ * @param force_output_format 是否强制使用指定的输出格式
+ * @return 成功返回0，失败返回负数错误码
+ */
 static int configure_audio_filters(VideoState *is, const char *afilters, int force_output_format)
 {
-    AVFilterContext *filt_asrc = NULL, *filt_asink = NULL;
-    char aresample_swr_opts[512] = "";
-    const AVDictionaryEntry *e = NULL;
-    AVBPrint bp;
-    char asrc_args[256];
+    AVFilterContext *filt_asrc = NULL, *filt_asink = NULL;  // 声明音频源滤镜和音频汇滤镜的上下文指针
+    char aresample_swr_opts[512] = "";                      // 用于存储重采样器(SWR)选项的字符串缓冲区
+    const AVDictionaryEntry *e = NULL;                      // 字典迭代器，用于遍历SWR选项
+    AVBPrint bp;                                            // 动态字符串打印缓冲区，用于构建通道布局描述
+    char asrc_args[256];                                    // 音频源滤镜的参数字符串
     int ret;
 
+    // === 初始化滤镜图 ===
+    // 释放之前的音频滤镜图内存
     avfilter_graph_free(&is->agraph);
-    if (!(is->agraph = avfilter_graph_alloc()))
-        return AVERROR(ENOMEM);
-    is->agraph->nb_threads = filter_nbthreads;
 
+    // 分配新的滤镜图
+    if (!(is->agraph = avfilter_graph_alloc()))
+        return AVERROR(ENOMEM);                             // 内存分配失败
+    // 设置滤镜图的线程数（用于并行处理）
+    is->agraph->nb_threads = filter_nbthreads;
+    // 初始化动态字符串打印缓冲区
     av_bprint_init(&bp, 0, AV_BPRINT_SIZE_AUTOMATIC);
 
+    // === 构建重采样器选项字符串 ===
+    // 遍历全局的SWR选项字典，将所有选项拼接成字符串
     while ((e = av_dict_iterate(swr_opts, e)))
         av_strlcatf(aresample_swr_opts, sizeof(aresample_swr_opts), "%s=%s:", e->key, e->value);
+    // 如果有选项，去掉最后一个冒号
     if (strlen(aresample_swr_opts))
         aresample_swr_opts[strlen(aresample_swr_opts)-1] = '\0';
+    // 将重采样选项设置到滤镜图中
     av_opt_set(is->agraph, "aresample_swr_opts", aresample_swr_opts, 0);
 
+    // === 准备音频源滤镜参数 ===
+    // 将通道布局描述写入动态缓冲区
     av_channel_layout_describe_bprint(&is->audio_filter_src.ch_layout, &bp);
 
+    // 构建abuffer滤镜的参数字符串
+    // 包含：采样率、采样格式、时间基、通道布局
     ret = snprintf(asrc_args, sizeof(asrc_args),
                    "sample_rate=%d:sample_fmt=%s:time_base=%d/%d:channel_layout=%s",
-                   is->audio_filter_src.freq, av_get_sample_fmt_name(is->audio_filter_src.fmt),
-                   1, is->audio_filter_src.freq, bp.str);
+                   is->audio_filter_src.freq,                                       // 采样率
+                   av_get_sample_fmt_name(is->audio_filter_src.fmt),                // 采样格式名称
+                   1, is->audio_filter_src.freq,                                    // 时间基（1/采样率）
+                   bp.str);                                                         // 通道布局描述
 
+    // === 创建音频源滤镜（abuffer）===
+    // abuffer是音频数据的输入点，接收解码后的音频帧
     ret = avfilter_graph_create_filter(&filt_asrc,
-                                       avfilter_get_by_name("abuffer"), "ffplay_abuffer",
-                                       asrc_args, NULL, is->agraph);
+                                       avfilter_get_by_name("abuffer"),             // 滤镜名称
+                                       "ffplay_abuffer",                            // 滤镜实例名
+                                       asrc_args,                                   // 滤镜参数
+                                       NULL,                                        // 额外选项
+                                       is->agraph);                                 // 所属滤镜图
     if (ret < 0)
-        goto end;
+        goto end;    // 创建失败，跳转到清理代码
 
+    // === 创建音频汇滤镜（abuffersink）===
+    // abuffersink是音频数据的输出点，提供处理后的音频帧
     filt_asink = avfilter_graph_alloc_filter(is->agraph, avfilter_get_by_name("abuffersink"),
                                              "ffplay_abuffersink");
     if (!filt_asink) {
-        ret = AVERROR(ENOMEM);
+        ret = AVERROR(ENOMEM);  // 分配失败
         goto end;
     }
 
+    // === 配置音频汇滤镜输出格式 ===
+    // 设置输出采样格式为16位有符号整数（最常用的音频格式）
     if ((ret = av_opt_set(filt_asink, "sample_formats", "s16", AV_OPT_SEARCH_CHILDREN)) < 0)
         goto end;
 
+    // 如果强制使用指定输出格式
     if (force_output_format) {
+        // 设置输出通道布局（如立体声、5.1环绕等）
         if ((ret = av_opt_set_array(filt_asink, "channel_layouts", AV_OPT_SEARCH_CHILDREN,
                                     0, 1, AV_OPT_TYPE_CHLAYOUT, &is->audio_tgt.ch_layout)) < 0)
             goto end;
+        // 设置输出采样率
         if ((ret = av_opt_set_array(filt_asink, "samplerates", AV_OPT_SEARCH_CHILDREN,
                                     0, 1, AV_OPT_TYPE_INT, &is->audio_tgt.freq)) < 0)
             goto end;
     }
 
+    // 初始化音频汇滤镜
     ret = avfilter_init_dict(filt_asink, NULL);
     if (ret < 0)
         goto end;
 
+    // === 配置完整的滤镜图 ===
+    // 将音频源、用户指定的滤镜链、音频汇连接起来
+    // 形成：abuffer -> [用户滤镜] -> abuffersink 的处理链
     if ((ret = configure_filtergraph(is->agraph, afilters, filt_asrc, filt_asink)) < 0)
         goto end;
 
-    is->in_audio_filter  = filt_asrc;
-    is->out_audio_filter = filt_asink;
+    // === 保存滤镜引用 ===
+    // 将创建的输入和输出滤镜保存到VideoState结构中，供后续使用
+    is->in_audio_filter  = filt_asrc;       // 音频数据输入点
+    is->out_audio_filter = filt_asink;      // 音频数据输出点
 
 end:
+    // === 错误处理和资源清理 ===
+    // 如果配置过程中发生错误，释放滤镜图内存
     if (ret < 0)
         avfilter_graph_free(&is->agraph);
+    // 释放动态字符串缓冲区
     av_bprint_finalize(&bp, NULL);
 
-    return ret;
+    return ret; // 返回结果码：0表示成功，负数表示错误
 }
 
 static int audio_thread(void *arg)
@@ -2784,7 +2828,7 @@ static int decoder_start(Decoder *d, int (*fn)(void *), const char *thread_name,
 static int video_thread(void *arg)
 {
     VideoState *is = arg;
-    AVFrame *frame = av_frame_alloc();  // 分配解码帧
+    AVFrame *frame = av_frame_alloc();  // 分配并默认初始化解码帧
     double pts;                         // pts
     double duration;                    // 帧持续时间
     int ret;
